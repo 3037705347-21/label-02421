@@ -1,243 +1,326 @@
-# 图书馆座位预约系统分析报告
+# 图书馆自习座位预约系统 - 技术分析文档
 
-## 一、座位状态流转业务逻辑
+## 一、座位状态流转整体流程
 
-### 1.1 座位状态定义
+### 1.1 状态定义
 
-| 状态值 | 状态说明 |
-|-------|----------|
-| 0 | 可用 |
-| 1 | 已预约 |
-| 2 | 维护中 |
+#### 座位状态 (Seat.status)
+| 值 | 状态 | 说明 |
+|----|------|------|
+| 0 | 可用 | 座位空闲，可预约 |
+| 1 | 已预约 | 已被用户预约，暂时不可被他人预约 |
+| 2 | 维护中 | 座位处于维护状态，不可预约 |
 
-### 1.2 预约状态定义
+#### 预约状态 (Reservation.status)
+| 值 | 状态 | 说明 |
+|----|------|------|
+| 0 | 待使用 | 用户已预约，未签到 |
+| 1 | 使用中 | 用户已签到，正在使用座位 |
+| 2 | 已完成 | 用户已打卡，流程结束 |
+| 3 | 已取消 | 用户主动取消预约 |
+| 4 | 超时未到 | 签到超时，系统自动取消 |
 
-| 状态值 | 状态说明 |
-|-------|----------|
-| 0 | 待使用 |
-| 1 | 使用中 |
-| 2 | 已完成 |
-| 3 | 已取消 |
-| 4 | 超时未到 |
-
-### 1.3 状态流转图
+### 1.2 完整状态流转图
 
 ```
-座位状态流转：
-┌─────────┐     ┌──────────┐     ┌──────────┐
-│  可用   │────▶│ 已预约  │────▶│ 使用中  │
-│ (status=0) │     │ (status=1) │     │          │
-└─────────┘     └──────────┘     └──────────┘
-     │                │                │
-     │                │                ▼
-     │                │           释放座位
-     │                │          回到可用(0)
-     │                │
-     │           ┌────▼────┐
-     │           │ 取消预约│
-     │           │ 或超时  │
-     │           └────┬────┘
-     │                │
-     └────────────────┘
-           回到可用(0)
+用户预约座位
+    ↓
+座位: 可用(0) → 已预约(1)
+预约: 待使用(0)
+    ↓
+    ├─────────────────────────────────┐
+    │                             超时未到(30分钟未签到)
+    ▼                                 ▼
+用户签到                         预约: 待使用→超时未到(4)
+预约: 待使用(0) → 使用中(1)         座位: 已预约→可用(0)
+    ↓
+    ├─────────────────────────────────┐
+    │                             超时结束(时段结束)
+    ▼                                 ▼
+上传打卡照片                   预约: 使用中→已完成(2)
+自动清洁度检测                   座位: 已预约→可用(0)
+    ↓
+    ├─────────────────────────────────┐
+    │                           人工复审
+    ▼                                 ▼
+自动检测通过(>=60分)             管理员设置通过/不通过
+预约: 使用中(1) → 已完成(2)
+座位: 已预约(1) → 可用(0)
+流程结束
 ```
 
-## 二、代码实现逻辑
+### 1.3 关键业务节点时间规则
 
-### 2.1 核心服务实现 (`ReservationServiceImpl.java:36-92`)
+| 操作 | 时间窗口 | 说明 |
+|------|----------|------|
+| 取消预约 | 签到前随时 | 状态为"待使用"时可取消 |
+| 签到 | 时段开始前15分钟 至 时段结束 | 例：时段08:00-10:00 → 07:45 后可签到 |
+| 超时判定 | 时段开始后30分钟 | 仍未签到则标记为超时 |
+| 预约时段 | 当天/未来 | 已完全过去的时段不可预约 |
 
-**创建预约：**
-1. 日期校验：预约日期不能早于今天
-2. 时间段校验：当天已完全过去的时间段不可预约
-3. 座位存在校验：座位必须存在且不是维护中
-4. 互斥校验：同一时间段座位不可重复预约，用户同一时间段不可重复预约
-5. 创建预约记录(status=0)，更新座位状态为已预约(status=1)
+---
 
-**取消预约：** (`ReservationServiceImpl.java:126-146`)
-1. 校验预约存在且属于当前用户
-2. 校验状态为"待使用"才可取消
-3. 更新预约状态为"已取消"(status=3)
-4. 恢复座位状态为"可用"(status=0)
+## 二、代码实现层面分析
 
-**签到功能：** (`ReservationServiceImpl.java:150-195`)
-1. 校验预约存在且属于当前用户
-2. 校验状态为"待使用"
-3. 时间校验：只允许在时段开始前15分钟到结束时间之间签到
-4. 更新预约状态为"使用中"(status=1)
+### 2.1 后端技术栈
+| 技术 | 用途 |
+|------|------|
+| Spring Boot 3.x | 后端框架 |
+| MyBatis Plus | ORM框架 |
+| JWT | 身份认证 |
+| MySQL 8.0 | 数据存储 |
+| Spring Scheduler | 定时任务 |
+| Java AWT ImageIO | 图像清洁度检测 |
 
-### 2.2 超时定时任务 (`ReservationTimeoutTask.java:35-95`)
+### 2.2 核心模块实现
 
-- **执行频率**：每分钟执行一次(`@Scheduled(fixedRate = 60000)`)
-- **超时规则**：
-  - 预约日期已过，状态仍为"待使用" → 标记为超时
-  - 当天预约，超过时段开始时间30分钟未签到 → 标记为超时
-- **处理动作**：更新预约status=4，释放座位回到可用status=0
+#### 1) 预约创建 - ReservationServiceImpl.createReservation()
+**位置**: `backend/src/main/java/com/library/seat/service/impl/ReservationServiceImpl.java:37`
 
-## 三、权限校验与设计模式
+**执行流程**：
+1. **日期校验**：预约日期不能早于今天
+2. **时段校验**：当天已完全过去的时间段不可预约
+3. **座位存在性校验**：检查座位是否存在
+4. **维护状态校验**：维护中座位不可预约
+5. **重复预约校验**：同一时间段座位已被预约则抛出异常
+6. **用户冲突校验**：用户同一时间段不能有多个预约
+7. **数据持久化**：创建预约记录(status=0)，更新座位状态(status=1)
 
-### 3.1 权限校验实现
+**关键代码**：
+```java
+// 校验同一时间段是否已被预约
+Long count = reservationMapper.selectCount(
+    new LambdaQueryWrapper<Reservation>()
+        .eq(Reservation::getSeatId, dto.getSeatId())
+        .eq(Reservation::getReserveDate, dto.getReserveDate())
+        .eq(Reservation::getTimeSlot, dto.getTimeSlot())
+        .in(Reservation::getStatus, 0, 1));
+```
 
-**JWT拦截器模式** (`JwtInterceptor.java:19-49`)
-- 实现 `HandlerInterceptor` 接口，采用**拦截器模式**
-- 在 `preHandle` 方法中：
-  1. 从Header获取Authorization token
-  2. 校验token格式、有效性、是否过期
-  3. 解析token存入userId、username、role到request属性
+#### 2) 签到功能 - ReservationServiceImpl.checkIn()
+**位置**: `backend/src/main/java/com/library/seat/service/impl/ReservationServiceImpl.java:150`
 
-**配置类** (`WebMvcConfig.java`)
-- 注册拦截器，配置白名单路径(登录、注册等无需认证)
+**执行流程**：
+1. 预约存在性校验 + 权限校验（只能操作自己的预约）
+2. 状态校验：必须是"待使用"状态才能签到
+3. 日期校验：必须在预约日期当天
+4. 时间窗口校验：时段开始前15分钟到结束时间之间
+5. 更新预约状态为：待使用(0) → 使用中(1)
+
+#### 3) 超时处理定时任务 - ReservationTimeoutTask
+**位置**: `backend/src/main/java/com/library/seat/task/ReservationTimeoutTask.java:37`
+
+**调度策略**：每分钟执行一次 (`@Scheduled(fixedRate = 60000)`)
+
+**处理逻辑**：
+1. 遍历所有状态为"待使用(0)"的预约
+2. 预约日期已过 → 直接标记超时
+3. 当天预约且时段开始超过30分钟未签到 → 标记超时
+4. 超时后：预约设为status=4，座位状态释放为可用
+
+#### 4) 清洁度检测服务 - CleanDetectionService
+**位置**: `backend/src/main/java/com/library/seat/service/CleanDetectionService.java:34`
+
+**检测算法（4项指标）**：
+
+| 指标 | 权重 | 计算方式 |
+|------|------|----------|
+| 亮度评分 | 25% | 干净桌面通常亮度均匀且较高(>=120满分) |
+| 均匀度评分 | 25% | 亮度标准差小则均匀 (<=35满分) |
+| 暗色占比评分 | 25% | 暗色像素占比 <=15% 满分 |
+| 区域一致性评分 | 25% | 8x8网格块亮度差异小 |
+
+**判定阈值**：综合得分 >= 60 → 清洁通过
+
+**降级策略**：Docker headless环境下自动切换为字节采样备用算法
+
+---
+
+## 三、设计模式与架构思想
+
+### 3.1 权限校验架构
+
+#### 1) 认证机制 - JWT拦截器
+
+**实现位置**：`JwtInterceptor.java:19`
+
+**架构层次**：
+```
+客户端请求
+    ↓ (Header: Authorization: Bearer {token})
+HandlerInterceptor.preHandle()
+    ├─ OPTIONS请求直接放行
+    ├─ Token格式校验
+    ├─ Token过期校验
+    └─ Token解析 → userId/username/role存入request属性
+    ↓
+Controller层
+    ↓
+Service层（通过@RequestAttribute获取）
+```
+
+#### 2) 授权校验
+
+**角色定义**（User.role）：
+- **0 - 普通用户**：座位浏览/预约/签到/打卡/取消
+- **1 - 管理员**：用户管理/座位管理/预约管理/审核/日志查看
+
+**校验方式 - 服务层方法级校验**：
+```java
+// ReservationServiceImpl.checkIn() - 操作权校验
+if (!reservation.getUserId().equals(userId)) {
+    throw new BusinessException("无权操作此预约");
+}
+```
 
 ### 3.2 设计模式应用
 
-1. **拦截器模式(Interceptor Pattern)**
-   - JwtInterceptor 实现统一的身份认证
-   - 无需在每个Controller中重复写认证逻辑
+| 模式 | 应用场景 | 优点 |
+|------|----------|------|
+| **拦截器模式** | JWT身份认证、操作日志AOP | 横切关注点分离，统一处理 |
+| **AOP切面** | `OperationLogAspect.java` - 日志记录 | 业务代码与日志解耦 |
+| **依赖注入** | Service层@RequiredArgsConstructor + @Service | 松耦合、易测试 |
+| **策略模式** | CleanDetectionService - 主/备检测算法切换 | 运行时动态选择、容错 |
+| **状态机** | Reservation/Seat状态流转控制 | 状态变更集中管理、边界清晰 |
+| **DTO模式** | LoginDTO/ReservationDTO等 | 数据隔离、防止敏感字段泄漏 |
+| **定时任务模式** | ReservationTimeoutTask超时处理 | 异步解耦、集中调度 |
 
-2. **面向切面编程(AOP)** (`OperationLogAspect.java:18-66`)
-   - `@Aspect` + `@Around` 实现操作日志记录
-   - 自定义注解 `@LogOperation` 标记需要日志的方法
-   - 解耦业务逻辑与横切关注点(日志)
+### 3.3 架构设计原则
 
-3. **依赖注入(DI)与控制反转(IoC)**
-   - `@RequiredArgsConstructor` (Lombok) 实现构造注入
-   - 服务间依赖松耦合，便于单元测试
+1. **单一职责原则 (SRP)**：
+   - ReservationService：预约创建/取消/签到
+   - CheckRecordService：打卡/清洁度审核
+   - CleanDetectionService：仅负责图像算法
+   - JwtInterceptor：仅负责认证
 
-4. **Mapper模式(MyBatis-Plus)**
-   - 继承BaseMapper实现CRUD
-   - LambdaQueryWrapper 类型安全的查询构建
+2. **开闭原则 (OCP)**：
+   - 新状态可通过扩展status枚举值添加
+   - 新校验规则可通过添加Service层方法实现
 
-5. **状态机思想(State Machine)**
-   - 预约和座位有明确的状态转换规则
-   - 每个操作前校验当前状态是否合法
-   - 事务保证状态转换的原子性(`@Transactional`)
+3. **错误处理**：
+   - 自定义`BusinessException` + `@RestControllerAdvice`全局异常捕获
+   - 服务层参数校验 → 异常抛出 → 全局拦截 → 标准化JSON返回
 
-6. **定时任务模式(Scheduled Task)**
-   - `@Scheduled` 处理超时这种异步的状态更新
+---
 
-### 3.3 架构分层(经典MVC)
+## 四、系统整体架构图
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Controller层                         │
-│  AuthController / SeatController / ReservationController │
-│     接收请求 → 参数校验 → 调用Service → 返回Result       │
-└─────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────┐
-│                      Service层                          │
-│   AuthService / SeatService / ReservationService        │
-│       业务逻辑 → 状态校验 → 事务控制 → Mapper调用        │
-└─────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────┐
-│                       Mapper层                          │
-│   SeatMapper / ReservationMapper / UserMapper           │
-│           MyBatis-Plus BaseMapper → 数据库IO           │
-└─────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────┐
-│                      Entity层                           │
-│   User / Seat / Reservation / CheckRecord               │
-│        与表一一对应 → 数据模型 → 表字段映射             │
-└─────────────────────────────────────────────────────────┘
-```
-
-## 四、全系统架构图
-
-### 4.1 系统拓扑图
+### 4.1 部署架构 (docker-compose.yml)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                            图书馆座位预约系统 架构                          │
+│                                 客户端浏览器                                 │
+└───────────────────┬─────────────────────────────────────────────────────────┘
+                    │
+                    │ 8081
+                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Frontend Admin (Vue3)                               │
+│  container: seat-frontend-admin                                             │
+│  ports: 8081:80                                                             │
+└───────────────────┬─────────────────────────────────────────────────────────┘
+                    │
+                    │ 8088 /api
+                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            Backend (Spring Boot)                            │
+│  container: seat-backend                                                    │
+│  ports: 8088:8088                                                           │
+│  modules: Controller / Service / Mapper / AOP / Scheduler                   │
+│  services:                                                                  │
+│    ├─ ReservationService   - 预约状态流转管理                               │
+│    ├─ CheckRecordService   - 打卡记录管理                                   │
+│    ├─ SeatService          - 座位CRUD                                       │
+│    ├─ CleanDetectionService - 图像清洁度检测                                │
+│    └─ ReservationTimeoutTask - 超时处理定时任务                             │
+└───────────────────┬─────────────────────────────────────────────────────────┘
+                    │ 3306 JDBC
+                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              MySQL 8.0 容器                                  │
+│  container: seat-mysql    port: 3307:3306                                   │
+│  database: seat_reservation                                                 │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  [前端层]                          [后端层]                          [数据层] │
-│                                                                             │
-│  frontend-admin/                SpringBoot 3.x                     MySQL 8.x│
-│  ┌──────────────────────┐       ┌──────────────────────────────┐       │
-│  │  Vue 3 + Vite        │       │  Controller  @RestController  │       │
-│  │  Element Plus        │───JWT──▶  Interceptor + AOP Aspect    │◀──JDBC──▶   │
-│  │  Vue Router + Pinia  │       │  Service + Scheduled Tasks    │       │
-│  │                      │       │  MyBatis-Plus Mapper          │       │
-│  └──────────────────────┘       └──────────────────────────────┘       │
-│          │                                    │                          │
-│          ▼                                    ▼                          ▼
-│  /api/auth/login                   ReservationTimeoutTask             seat_reservation
-│  /api/reservation          ┌──────────────────────────────────┐       ├── sys_user
-│  /api/seat                 │ Result 统一返回                  │       ├── seat
-│  /api/check                │ DTO 数据传输                     │       ├── reservation
-│  /api/log                  │ GlobalException 全局异常         │       ├── check_record
-│                             └──────────────────────────────────┘       └── operation_log
-│                                                                             │
-│  Docker 容器编排                                                             │
-│  docker-compose.yml ───▶  frontend-admin + backend + mysql                   │
+│  Tables:                                                                    │
+│  ┌──────────────┐  ┌──────────────────┐  ┌────────────────────┐             │
+│  │   sys_user   │  │    seat          │  │ reservation        │             │
+│  │ - id         │  │  - id            │  │  - id              │             │
+│  │ - username   │  │  - seat_no       │  │  - user_id         │             │
+│  │ - password   │  │  - status {0,1,2}│  │  - seat_id         │             │
+│  │ - role {0,1} │  │  - area          │  │  - time_slot       │             │
+│  └──────────────┘  └──────────────────┘  │  - status {0,1,2,3,4}            │
+│  ┌──────────────────┐  ┌──────────────┐  └────────────────────┘             │
+│  │ check_record     │  │operation_log │                                     │
+│  │ - reservation_id │  │ - module     │                                     │
+│  │ - auto_score     │  │ - action     │                                     │
+│  │ - clean_passed   │  │ - user_id    │                                     │
+│  └──────────────────┘  └──────────────┘                                     │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 数据流图(预约场景)
+### 4.2 层次架构 (MVC)
 
 ```
-用户点击预约
-    │
-    ▼
-[前端Vue组件]
-    │ SeatDTO(seatId, reserveDate, timeSlot)
-    ▼
-HTTP POST /api/reservation
-    │
-    ▼
-[JwtInterceptor]
-    │ 1. 校验Token有效
-    │ 2. 解析出userId
-    ▼
-[ReservationController.create]
-    │ 调用 service.create(userId, dto)
-    ▼
-[ReservationServiceImpl.createReservation]
-    │
-    ├─────────────────────────────────┐
-    │ 1. 日期、时段合法性校验          │
-    │ 2. 查询seat：status != 2        │
-    │ 3. selectCount 该时段seat已预约? │
-    │ 4. selectCount user是否重复预约 │
-    │ 5. reservation insert(status=0)│
-    │ 6. seat update(status=1)        │
-    └─────────────────────────────────┘
-              │ 两个表更新在一个事务
-              ▼ @Transactional
-[MySQL - seat & reservation 表原子更新]
-    │
-    ├──── reservation表：一条status=0的预约
-    └──── seat表：对应id座位status=1
-
-                              ┌─────────────────────────┐
-                              │ ReservationTimeoutTask  │
-                              │ 每分钟扫描 status=0      │
-                              │ 超时则 set status=4     │
-                              │ 并恢复 seat status=0    │
-                              └─────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Presentation Layer                                 │
+│  Vue3 + Vite 前端                                                           │
+│  Views: Login / SeatList / MyReservations                                   │
+│         Admin: User/Seat/Reservation/CheckRecord/Log                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                              ↓ HTTP / JSON
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Controller Layer                                   │
+│  @RestController                                                            │
+│  AuthController / SeatController / ReservationController                    │
+│  CheckRecordController / UserController / OperationLogController            │
+└─────────────────────────────────────────────────────────────────────────────┘
+                              ↓ 调用 + 权限判断
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            Service Layer                                    │
+│  @Service + 事务 @Transactional                                             │
+│  ReservationServiceImpl / CheckRecordServiceImpl                            │
+│    + ReservationTimeoutTask (Scheduled)                                     │
+│    + CleanDetectionService 【核心算法模块】                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                              ↓ MyBatis Plus
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Mapper Layer                                   │
+│  BaseMapper<T> / LambdaQueryWrapper                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+                              ↓ JDBC
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                             Database Layer                                  │
+│  MySQL 8.0 - 支持事务 + 行级锁                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 五、核心类表结构
+### 4.3 跨模块协作时序图：预约完整流程
 
-### 5.1 reservation表 (核心状态承载)
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | BIGINT | PK |
-| user_id | BIGINT | FK 用户 |
-| seat_id | BIGINT | FK 座位 |
-| reserve_date | DATE | 预约日期 |
-| time_slot | VARCHAR | 时段如"08:00-10:00" |
-| **status** | TINYINT | **核心状态字段** |
-| check_in_time | DATETIME | 签到时间 |
-
-### 5.2 seat表
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | BIGINT | PK |
-| seat_no | VARCHAR | A-001 格式 |
-| **status** | TINYINT | 0/1/2 |
-| has_charger/near_window | TINYINT | 属性标签 |
-| area, floor | 属性 | 区域、楼层 |
+```
+用户         前端         AuthContr        ReservationServ       DB
+ │            │             │                 │                │
+ │ 登录请求    │             │                 │                │
+ ├───────────►│ POST /login │                 │                │
+ │            ├────────────►│ 校验 + JWT生成   │                │
+ │            │             ├────────────────►│ 查询User        │
+ │            │             │◄────────────────┤ 返回User + 密码校验
+ │ 接收Token   │◄────────────┤ 返回{token}      │                │
+ │◄───────────┤             │                 │                │
+ │            │             │                 │                │
+ │ 预约请求    │ 携带Token    │                 │                │
+ ├───────────►│ POST /api/reservation         │                │
+ │            ├────────────►│JWT拦截器        │                │
+ │            │             │ 校验Token有效   │                │
+ │            │             ├────────────────►│ 校验日期/时段   │
+ │            │             │                 │ 座位状态校验    │
+ │            │             │                 ├───────────────►│ SELECT seat
+ │            │             │                 │◄───────────────┤ 返回座位 status=0
+ │            │             │                 │                │
+ │            │             │                 │ 冲突校验 + 落库 │
+ │            │             │                 │ INSERT reservation status=0
+ │            │             │                 │ UPDATE seat status=1
+ │            │             │                 ├───────────────►│
+ │            │             │                 │◄───────────────┤ 事务提交
+ │ 预约成功    │◄────────────┤◄────────────────┤ 返回成功        │
+ │◄───────────┤             │                 │                │
+```
