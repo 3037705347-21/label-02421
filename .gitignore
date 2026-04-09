@@ -1,0 +1,34 @@
+# ========== IDE ==========
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.cursor/
+
+# ========== OS ==========
+.DS_Store
+Thumbs.db
+
+# ========== Java / Maven (backend) ==========
+backend/target/
+backend/*.jar
+backend/*.war
+backend/uploads/
+*.class
+*.log
+
+# ========== Node / Frontend (frontend-admin) ==========
+frontend-admin/node_modules/
+frontend-admin/dist/
+frontend-admin/.env.local
+frontend-admin/.env.*.local
+
+# ========== Docker ==========
+docker-compose.override.yml
+
+# ========== Misc ==========
+*.swp
+*.swo
+*~
+.env
